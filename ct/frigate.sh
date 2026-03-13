@@ -17,8 +17,6 @@ var_unprivileged="0"
 
 header_info "$APP"
 color
-no_default_credentials
-credentials_check
 
 function detect_openvino_default() {
   if grep -qm1 'avx' /proc/cpuinfo; then
