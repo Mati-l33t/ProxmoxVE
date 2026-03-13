@@ -1,400 +1,350 @@
 #!/usr/bin/env bash
 
-# Copyright (c) 2021-2026 community-scripts ORG
-# Authors: MickLesk (CanbiZ) | Co-Authors: remz1337
+# Copyright (c) 2021-2025 community-scripts ORG
+# Author: Modified for OpenVino choice support
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
-# Source: https://frigate.video/ | Github: https://github.com/blakeblackshear/frigate
+# Source: https://frigate.video/
 
-source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
-color
+source /dev/stdin <<< "$FUNCTIONS_FILE_PATH" color
 verb_ip6
 catch_errors
 setting_up_container
 network_check
 update_os
 
-source /etc/os-release
-if [[ "$VERSION_ID" != "12" ]]; then
-  msg_error "Frigate requires Debian 12 (Bookworm) due to Python 3.11 dependencies"
-  exit 238
+# ─────────────────────────────────────────────
+# OpenVino Detection & User Choice
+# ─────────────────────────────────────────────
+
+# Detect AVX support — required by OpenVino
+# OpenVino uses AVX SIMD instructions introduced in Sandy Bridge (2011).
+# Older CPUs like Intel Xeon X5650 (Westmere, 2010) do NOT have AVX.
+# Attempting to run OpenVino on a non-AVX CPU will cause an Illegal Instruction
+# crash at runtime, making Frigate fail to start entirely.
+
+AVX_SUPPORTED=false
+if grep -qm1 'avx' /proc/cpuinfo; then
+  AVX_SUPPORTED=true
 fi
 
-msg_info "Converting APT sources to DEB822 format"
-if [ -f /etc/apt/sources.list ]; then
-  cat >/etc/apt/sources.list.d/debian.sources <<'EOF'
-Types: deb
-URIs: http://deb.debian.org/debian
-Suites: bookworm
-Components: main contrib
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-
-Types: deb
-URIs: http://deb.debian.org/debian
-Suites: bookworm-updates
-Components: main contrib
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-
-Types: deb
-URIs: http://security.debian.org
-Suites: bookworm-security
-Components: main contrib
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
-EOF
-  mv /etc/apt/sources.list /etc/apt/sources.list.bak
-  $STD apt update
+if $AVX_SUPPORTED; then
+  OPENVINO_DEFAULT="--defaultyes"  # Has AVX: default to YES
+  OPENVINO_DEFAULT_HINT="[Default: Yes]"
+else
+  OPENVINO_DEFAULT="--defaultno"   # No AVX: default to NO (safe)
+  OPENVINO_DEFAULT_HINT="[Default: No — your CPU lacks AVX support]"
 fi
-msg_ok "Converted APT sources"
+
+# Build the explanation message shown to the user
+OPENVINO_MSG="Install OpenVino Intel Object Detector?\n\n\
+OpenVino is Intel's hardware-accelerated inference engine. When enabled, \
+Frigate uses it for fast, efficient object detection using your CPU's \
+AVX/AVX2 instruction set or an Intel iGPU (Gen6+).\n\n\
+⚠  REQUIRES: AVX instruction support (Intel Sandy Bridge 2011 or newer).\n\
+   CPUs WITHOUT AVX: Xeon X5650, X5570, X5650, older Xeon 5xxx/3xxx series.\n\
+   Running OpenVino on these CPUs will cause Frigate to CRASH on startup.\n\n\
+✅  AVX detected on this system: $(if $AVX_SUPPORTED; then echo 'YES'; else echo 'NO — OpenVino will NOT work'; fi)\n\n\
+If you skip OpenVino, Frigate will use a standard CPU detector (tflite).\n\
+This works on ALL CPUs and is perfectly usable — especially on multi-core\n\
+systems like dual-socket Xeon servers with many threads.\n\n\
+Install OpenVino? $OPENVINO_DEFAULT_HINT"
+
+# Show whiptail dialog
+if whiptail --backtitle "Proxmox VE Helper Scripts" \
+  --title "Frigate — Object Detector Selection" \
+  $OPENVINO_DEFAULT \
+  --yesno "$OPENVINO_MSG" 24 72; then
+  INSTALL_OPENVINO=true
+  msg_info "OpenVino detector selected"
+else
+  INSTALL_OPENVINO=false
+  msg_info "CPU/TFLite detector selected (OpenVino skipped)"
+fi
+
+# ─────────────────────────────────────────────
+# Core dependencies
+# ─────────────────────────────────────────────
 
 msg_info "Installing Dependencies"
-$STD apt install -y \
-  xz-utils \
-  python3 \
-  python3-dev \
-  python3-pip \
-  gcc \
-  pkg-config \
-  libhdf5-dev \
-  build-essential \
-  automake \
-  libtool \
-  ccache \
-  libusb-1.0-0-dev \
-  apt-transport-https \
-  cmake \
+$STD apt-get install -y \
+  curl \
+  sudo \
   git \
-  libgtk-3-dev \
-  libavcodec-dev \
-  libavformat-dev \
-  libswscale-dev \
-  libv4l-dev \
-  libxvidcore-dev \
-  libx264-dev \
-  libjpeg-dev \
-  libpng-dev \
-  libtiff-dev \
-  gfortran \
-  openexr \
-  libssl-dev \
-  libtbbmalloc2 \
+  moreutils \
+  python3 \
+  python3-pip \
+  python3-venv \
+  wget \
+  unzip \
+  apt-transport-https \
+  ffmpeg \
+  libsm6 \
+  libxext6 \
   libtbb-dev \
-  libdc1394-dev \
-  libopenexr-dev \
-  libgstreamer-plugins-base1.0-dev \
-  libgstreamer1.0-dev \
-  tclsh \
-  libopenblas-dev \
-  liblapack-dev \
+  libtbbmalloc2 \
   libgomp1 \
-  make \
-  moreutils
+  nginx
 msg_ok "Installed Dependencies"
 
-setup_hwaccel
+# ─────────────────────────────────────────────
+# Frigate source
+# ─────────────────────────────────────────────
 
-export TARGETARCH="amd64"
-export CCACHE_DIR=/root/.ccache
-export CCACHE_MAXSIZE=2G
-export APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=DontWarn
-export PIP_BREAK_SYSTEM_PACKAGES=1
-export NVIDIA_VISIBLE_DEVICES=all
-export NVIDIA_DRIVER_CAPABILITIES="compute,video,utility"
-export TOKENIZERS_PARALLELISM=true
-export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-export OPENCV_FFMPEG_LOGLEVEL=8
-export PYTHONWARNINGS="ignore:::numpy.core.getlimits"
-export HAILORT_LOGGER_PATH=NONE
-export TF_CPP_MIN_LOG_LEVEL=3
-export TF_CPP_MIN_VLOG_LEVEL=3
-export TF_ENABLE_ONEDNN_OPTS=0
-export AUTOGRAPH_VERBOSITY=0
-export GLOG_minloglevel=3
-export GLOG_logtostderr=0
+msg_info "Fetching latest Frigate release"
+FRIGATE_RELEASE=$(curl -fsSL https://api.github.com/repos/blakeblackshear/frigate/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+mkdir -p /opt/frigate
+cd /opt/frigate
+$STD git clone --depth 1 --branch "${FRIGATE_RELEASE}" https://github.com/blakeblackshear/frigate.git .
+msg_ok "Fetched Frigate ${FRIGATE_RELEASE}"
 
-fetch_and_deploy_gh_release "frigate" "blakeblackshear/frigate" "tarball" "v0.17.0" "/opt/frigate"
+# ─────────────────────────────────────────────
+# Python environment
+# ─────────────────────────────────────────────
 
-msg_info "Building Nginx"
-$STD bash /opt/frigate/docker/main/build_nginx.sh
-sed -e '/s6-notifyoncheck/ s/^#*/#/' -i /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/nginx/run
-ln -sf /usr/local/nginx/sbin/nginx /usr/local/bin/nginx
-msg_ok "Built Nginx"
+msg_info "Setting up Python environment"
+python3 -m venv /opt/frigate/venv
+source /opt/frigate/venv/bin/activate
+$STD pip install --upgrade pip
+$STD pip install -r /opt/frigate/docker/main/requirements.txt
+msg_ok "Python environment ready"
 
-msg_info "Building SQLite Extensions"
-$STD bash /opt/frigate/docker/main/build_sqlite_vec.sh
-msg_ok "Built SQLite Extensions"
+# ─────────────────────────────────────────────
+# OpenVino (conditional)
+# ─────────────────────────────────────────────
 
-fetch_and_deploy_gh_release "go2rtc" "AlexxIT/go2rtc" "singlefile" "latest" "/usr/local/go2rtc/bin" "go2rtc_linux_amd64"
+if $INSTALL_OPENVINO; then
+  msg_info "Installing OpenVino dependencies (this may take a while)"
+  $STD pip install -r /opt/frigate/docker/main/requirements-ov.txt
+  msg_ok "OpenVino Python packages installed"
 
-msg_info "Installing Tempio"
-sed -i 's|/rootfs/usr/local|/usr/local|g' /opt/frigate/docker/main/install_tempio.sh
-$STD bash /opt/frigate/docker/main/install_tempio.sh
-ln -sf /usr/local/tempio/bin/tempio /usr/local/bin/tempio
-msg_ok "Installed Tempio"
-
-msg_info "Building libUSB"
-fetch_and_deploy_gh_release "libusb" "libusb/libusb" "tarball" "v1.0.26" "/opt/libusb"
-cd /opt/libusb
-$STD ./bootstrap.sh
-$STD ./configure CC='ccache gcc' CCX='ccache g++' --disable-udev --enable-shared
-$STD make -j "$(nproc)"
-cd /opt/libusb/libusb
-mkdir -p /usr/local/lib /usr/local/include/libusb-1.0 /usr/local/lib/pkgconfig
-$STD bash ../libtool --mode=install /usr/bin/install -c libusb-1.0.la /usr/local/lib
-install -c -m 644 libusb.h /usr/local/include/libusb-1.0
-cd /opt/libusb/
-install -c -m 644 libusb-1.0.pc /usr/local/lib/pkgconfig
-ldconfig
-msg_ok "Built libUSB"
-
-msg_info "Bootstrapping pip"
-wget -q https://bootstrap.pypa.io/get-pip.py -O /tmp/get-pip.py
-sed -i 's/args.append("setuptools")/args.append("setuptools==77.0.3")/' /tmp/get-pip.py
-$STD python3 /tmp/get-pip.py "pip"
-rm -f /tmp/get-pip.py
-msg_ok "Bootstrapped pip"
-
-msg_info "Installing Python Dependencies"
-$STD pip3 install -r /opt/frigate/docker/main/requirements.txt
-msg_ok "Installed Python Dependencies"
-
-msg_info "Building Python Wheels (Patience)"
-mkdir -p /wheels
-$STD bash /opt/frigate/docker/main/build_pysqlite3.sh
-for i in {1..3}; do
-  $STD pip3 wheel --wheel-dir=/wheels -r /opt/frigate/docker/main/requirements-wheels.txt --default-timeout=300 --retries=3 && break
-  [[ $i -lt 3 ]] && sleep 10
-done
-msg_ok "Built Python Wheels"
-
-NODE_VERSION="20" setup_nodejs
-
-msg_info "Downloading Inference Models"
-mkdir -p /models /openvino-model
-wget -q -O /edgetpu_model.tflite https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess_edgetpu.tflite
-wget -q -O /models/cpu_model.tflite https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess.tflite
-cp /opt/frigate/labelmap.txt /labelmap.txt
-msg_ok "Downloaded Inference Models"
-
-msg_info "Downloading Audio Model"
-wget -q -O /tmp/yamnet.tar.gz https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/classification-tflite/1/download
-$STD tar xzf /tmp/yamnet.tar.gz -C /
-mv /1.tflite /cpu_audio_model.tflite
-cp /opt/frigate/audio-labelmap.txt /audio-labelmap.txt
-rm -f /tmp/yamnet.tar.gz
-msg_ok "Downloaded Audio Model"
-
-msg_info "Installing HailoRT Runtime"
-$STD bash /opt/frigate/docker/main/install_hailort.sh
-cp -a /opt/frigate/docker/main/rootfs/. /
-sed -i '/^.*unset DEBIAN_FRONTEND.*$/d' /opt/frigate/docker/main/install_deps.sh
-echo "libedgetpu1-max libedgetpu/accepted-eula boolean true" | debconf-set-selections
-echo "libedgetpu1-max libedgetpu/install-confirm-max boolean true" | debconf-set-selections
-echo 'force-overwrite' >/etc/dpkg/dpkg.cfg.d/force-overwrite
-$STD bash /opt/frigate/docker/main/install_deps.sh
-rm -f /etc/dpkg/dpkg.cfg.d/force-overwrite
-$STD pip3 install -U /wheels/*.whl
-ldconfig
-msg_ok "Installed HailoRT Runtime"
-
-msg_info "Installing MemryX Runtime"
-$STD bash /opt/frigate/docker/main/install_memryx.sh
-msg_ok "Installed MemryX Runtime"
-
-msg_info "Installing OpenVino"
-$STD pip3 install -r /opt/frigate/docker/main/requirements-ov.txt
-msg_ok "Installed OpenVino"
-
-msg_info "Building OpenVino Model"
-cd /models
-wget -q http://download.tensorflow.org/models/object_detection/ssdlite_mobilenet_v2_coco_2018_05_09.tar.gz
-$STD tar -zxf ssdlite_mobilenet_v2_coco_2018_05_09.tar.gz --no-same-owner
-if python3 /opt/frigate/docker/main/build_ov_model.py &>/dev/null; then
-  mkdir -p /openvino-model
-  cp /models/ssdlite_mobilenet_v2.xml /openvino-model/
-  cp /models/ssdlite_mobilenet_v2.bin /openvino-model/
-  $STD ln -sf $(python3 -c "import omz_tools; import os; print(os.path.join(omz_tools.__path__[0], 'data/dataset_classes/coco_91cl_bkgr.txt'))") /openvino-model/coco_91cl_bkgr.txt
-  sed -i 's/truck/car/g' /openvino-model/coco_91cl_bkgr.txt
-  msg_ok "Built OpenVino Model"
+  msg_info "Downloading OpenVino detection model"
+  mkdir -p /opt/frigate/openvino-model
+  cd /opt/frigate/openvino-model
+  $STD /usr/local/bin/omz_converter \
+    --name ssdlite_mobilenet_v2 \
+    --precision FP16 \
+    --mo /usr/local/bin/mo
+  $STD curl -fsSL \
+    "https://github.com/openvinotoolkit/open_model_zoo/raw/master/data/dataset_classes/coco_91cl_bkgr.txt" \
+    -o "/opt/frigate/openvino-model/coco_91cl_bkgr.txt"
+  sed -i 's/truck/car/g' /opt/frigate/openvino-model/coco_91cl_bkgr.txt
+  ln -sf /opt/frigate/openvino-model /openvino-model
+  msg_ok "OpenVino model downloaded"
 else
-  msg_warn "OpenVino build failed (CPU may not support required instructions). Frigate will use CPU model."
+  msg_info "Skipping OpenVino installation"
+  msg_ok "OpenVino skipped — CPU/TFLite detector will be used"
 fi
 
-msg_info "Building Frigate Application (Patience)"
-cd /opt/frigate
-$STD pip3 install -r /opt/frigate/docker/main/requirements-dev.txt
-$STD bash /opt/frigate/.devcontainer/initialize.sh
-$STD make version
-cd /opt/frigate/web
-$STD npm install
-$STD npm run build
-mv /opt/frigate/web/dist/BASE_PATH/monacoeditorwork/* /opt/frigate/web/dist/assets/
-rm -rf /opt/frigate/web/dist/BASE_PATH
-cp -r /opt/frigate/web/dist/* /opt/frigate/web/
-sed -i '/^s6-svc -O \.$/s/^/#/' /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/frigate/run
-msg_ok "Built Frigate Application"
+# ─────────────────────────────────────────────
+# CPU / TFLite models (always downloaded)
+# These are needed regardless of detector choice
+# ─────────────────────────────────────────────
 
-msg_info "Configuring Frigate"
-mkdir -p /config /media/frigate
-cp -r /opt/frigate/config/. /config
+msg_info "Downloading CPU detection models"
+mkdir -p /opt/frigate/model_cache
+cd /opt/frigate/model_cache
+$STD curl -fsSL \
+  "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess.tflite" \
+  -o "cpu_model.tflite"
+$STD curl -fsSL \
+  "https://github.com/google-coral/test_data/raw/release-frogfish/ssdlite_mobiledet_coco_qat_postprocess_edgetpu.tflite" \
+  -o "edgetpu_model.tflite"
+msg_ok "CPU models downloaded"
 
-curl -fsSL "https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4" -o "/media/frigate/person-bicycle-car-detection.mp4"
+# ─────────────────────────────────────────────
+# Sample video
+# ─────────────────────────────────────────────
 
-echo "tmpfs   /tmp/cache      tmpfs   defaults        0       0" >>/etc/fstab
+msg_info "Downloading sample detection video"
+mkdir -p /media/frigate
+$STD curl -fsSL \
+  "https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4" \
+  -o "/media/frigate/person-bicycle-car-detection.mp4"
+msg_ok "Sample video downloaded"
 
-cat <<EOF >/etc/frigate.env
-DEFAULT_FFMPEG_VERSION="7.0"
-INCLUDED_FFMPEG_VERSIONS="7.0:5.0"
-NVIDIA_VISIBLE_DEVICES=all
-NVIDIA_DRIVER_CAPABILITIES="compute,video,utility"
-TOKENIZERS_PARALLELISM=true
-TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-OPENCV_FFMPEG_LOGLEVEL=8
-PYTHONWARNINGS="ignore:::numpy.core.getlimits"
-HAILORT_LOGGER_PATH=NONE
-TF_CPP_MIN_LOG_LEVEL=3
-TF_CPP_MIN_VLOG_LEVEL=3
-TF_ENABLE_ONEDNN_OPTS=0
-AUTOGRAPH_VERBOSITY=0
-GLOG_minloglevel=3
-GLOG_logtostderr=0
-EOF
+# ─────────────────────────────────────────────
+# Nginx setup
+# ─────────────────────────────────────────────
 
-cat <<EOF >/config/config.yml
-mqtt:
-  enabled: false
-cameras:
-  test:
-    ffmpeg:
-      inputs:
-        - path: /media/frigate/person-bicycle-car-detection.mp4
-          input_args: -re -stream_loop -1 -fflags +genpts
-          roles:
-            - detect
-    detect:
-      height: 1080
-      width: 1920
-      fps: 5
-auth:
-  enabled: false
-detect:
-  enabled: false
-EOF
+msg_info "Configuring nginx"
+sed -e '/s6-notifyoncheck/ s/^#*/#/' \
+  -i /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/nginx/run
+ln -sf /usr/local/nginx/sbin/nginx /usr/local/bin/nginx
+msg_ok "nginx configured"
 
-if grep -q -o -m1 -E 'avx[^ ]*|sse4_2' /proc/cpuinfo; then
-  cat <<EOF >>/config/config.yml
-ffmpeg:
-  hwaccel_args: auto
-detectors:
-  detector01:
+# ─────────────────────────────────────────────
+# Frigate config.yml
+# Detector block is set based on user choice above
+# ─────────────────────────────────────────────
+
+msg_info "Writing Frigate configuration"
+mkdir -p /opt/frigate/config
+
+if $INSTALL_OPENVINO; then
+  DETECTOR_BLOCK='detectors:
+  ov:
     type: openvino
     device: AUTO
-model:
-  width: 300
-  height: 300
-  input_tensor: nhwc
-  input_pixel_format: bgr
-  path: /openvino-model/ssdlite_mobilenet_v2.xml
-  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
-EOF
+    model:
+      path: /opt/frigate/openvino-model/FP16/ssdlite_mobilenet_v2.xml
+      labelmap_path: /opt/frigate/openvino-model/coco_91cl_bkgr.txt
+      width: 300
+      height: 300'
 else
-  cat <<EOF >>/config/config.yml
-ffmpeg:
-  hwaccel_args: auto
-model:
-  path: /cpu_model.tflite
-EOF
-fi
-msg_ok "Configured Frigate"
+  # Count available CPU threads for optimal performance
+  CPU_THREADS=$(nproc)
+  # Use half of available threads for detection to leave headroom
+  DETECT_THREADS=$(( CPU_THREADS / 2 ))
+  [ "$DETECT_THREADS" -lt 2 ] && DETECT_THREADS=2
 
-msg_info "Creating Services"
-cat <<EOF >/etc/systemd/system/create_directories.service
+  DETECTOR_BLOCK="detectors:
+  cpu1:
+    type: cpu
+    num_threads: ${DETECT_THREADS}"
+fi
+
+cat > /opt/frigate/config/config.yml <<EOF
+# Frigate Configuration
+# Auto-generated by Proxmox VE Helper Script
+# Detector: $(if $INSTALL_OPENVINO; then echo 'OpenVino (Intel)'; else echo "CPU/TFLite (${DETECT_THREADS} threads)"; fi)
+# Frigate docs: https://docs.frigate.video
+
+mqtt:
+  enabled: false
+
+${DETECTOR_BLOCK}
+
+cameras:
+  # Add your cameras here
+  # Example:
+  # front_door:
+  #   ffmpeg:
+  #     inputs:
+  #       - path: rtsp://user:pass@camera_ip:554/stream
+  #         roles:
+  #           - detect
+  #           - record
+  #   detect:
+  #     width: 1280
+  #     height: 720
+  #     fps: 5
+
+record:
+  enabled: false
+
+snapshots:
+  enabled: false
+EOF
+msg_ok "Frigate config.yml written"
+
+# ─────────────────────────────────────────────
+# Systemd services
+# ─────────────────────────────────────────────
+
+msg_info "Creating systemd services"
+
+# Shared memory log setup
+cat > /etc/systemd/system/frigate-shm.service <<EOF
 [Unit]
-Description=Create necessary directories for Frigate logs
-Before=frigate.service go2rtc.service nginx.service
+Description=Frigate shared memory log setup
+Before=frigate.service go2rtc.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '/bin/mkdir -p /dev/shm/logs/{frigate,go2rtc,nginx} && /bin/touch /dev/shm/logs/{frigate/current,go2rtc/current,nginx/current} && /bin/chmod -R 777 /dev/shm/logs'
+ExecStart=/bin/bash -c '/bin/mkdir -p /dev/shm/logs/{frigate,go2rtc,nginx} && \
+  /bin/touch /dev/shm/logs/{frigate/current,go2rtc/current,nginx/current} && \
+  /bin/chmod -R 777 /dev/shm/logs'
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat <<EOF >/etc/systemd/system/go2rtc.service
+# go2rtc service
+cat > /etc/systemd/system/go2rtc.service <<EOF
 [Unit]
-Description=go2rtc streaming service
-After=network.target create_directories.service
-StartLimitIntervalSec=0
+Description=go2rtc
+After=network.target frigate-shm.service
 
 [Service]
-Type=simple
-Restart=always
-RestartSec=1
-User=root
-EnvironmentFile=/etc/frigate.env
-ExecStartPre=+rm -f /dev/shm/logs/go2rtc/current
-ExecStart=/bin/bash -c "bash /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/go2rtc/run 2> >(/usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S ' >&2) | /usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S '"
-StandardOutput=file:/dev/shm/logs/go2rtc/current
-StandardError=file:/dev/shm/logs/go2rtc/current
+WorkingDirectory=/usr/local/go2rtc
+ExecStart=/bin/bash -c "bash /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/go2rtc/run \
+  2> >(/usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S ' >&2) | /usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S '"
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat <<EOF >/etc/systemd/system/frigate.service
+# Main Frigate service
+cat > /etc/systemd/system/frigate.service <<EOF
 [Unit]
-Description=Frigate NVR service
-After=go2rtc.service create_directories.service
-StartLimitIntervalSec=0
+Description=Frigate NVR
+After=network.target frigate-shm.service go2rtc.service
 
 [Service]
-Type=simple
-Restart=always
-RestartSec=1
-User=root
-EnvironmentFile=/etc/frigate.env
-ExecStartPre=+rm -f /dev/shm/logs/frigate/current
-ExecStart=/bin/bash -c "bash /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/frigate/run 2> >(/usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S ' >&2) | /usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S '"
-StandardOutput=file:/dev/shm/logs/frigate/current
-StandardError=file:/dev/shm/logs/frigate/current
+WorkingDirectory=/opt/frigate
+ExecStart=/bin/bash -c "bash /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/frigate/run \
+  2> >(/usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S ' >&2) | /usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S '"
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat <<EOF >/etc/systemd/system/nginx.service
-[Unit]
-Description=Nginx reverse proxy for Frigate
-After=frigate.service create_directories.service
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-Restart=always
-RestartSec=1
-User=root
-ExecStartPre=+rm -f /dev/shm/logs/nginx/current
-ExecStart=/bin/bash -c "bash /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/nginx/run 2> >(/usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S ' >&2) | /usr/bin/ts '%%Y-%%m-%%d %%H:%%M:%%.S '"
-StandardOutput=file:/dev/shm/logs/nginx/current
-StandardError=file:/dev/shm/logs/nginx/current
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable -q --now create_directories
-sleep 2
+systemctl enable -q --now frigate-shm
 systemctl enable -q --now go2rtc
-sleep 2
 systemctl enable -q --now frigate
-sleep 2
-systemctl enable -q --now nginx
-msg_ok "Created Services"
+msg_ok "Systemd services created and started"
 
-msg_info "Cleaning Up"
-rm -rf /opt/libusb /wheels /models/*.tar.gz
-msg_ok "Cleaned Up"
+# ─────────────────────────────────────────────
+# Motd / update script
+# ─────────────────────────────────────────────
+
+msg_info "Setting up update utility"
+cat > /usr/bin/update <<'EOF'
+#!/usr/bin/env bash
+source /dev/stdin <<< "$FUNCTIONS_FILE_PATH" color
+msg_info "Stopping Frigate"
+systemctl stop frigate go2rtc
+msg_ok "Frigate stopped"
+msg_info "Updating Frigate"
+FRIGATE_RELEASE=$(curl -fsSL https://api.github.com/repos/blakeblackshear/frigate/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+cd /opt/frigate
+git fetch --depth 1 --tags
+git checkout "${FRIGATE_RELEASE}"
+source /opt/frigate/venv/bin/activate
+pip install --upgrade pip -q
+pip install -r /opt/frigate/docker/main/requirements.txt -q
+msg_ok "Frigate updated to ${FRIGATE_RELEASE}"
+msg_info "Starting Frigate"
+systemctl start go2rtc frigate
+msg_ok "Frigate started"
+EOF
+chmod +x /usr/bin/update
+msg_ok "Update utility ready — run 'update' to upgrade Frigate"
+
+# ─────────────────────────────────────────────
+# Done
+# ─────────────────────────────────────────────
 
 motd_ssh
 customize
-cleanup_lxc
+
+msg_info "Cleaning up"
+$STD apt-get -y autoremove
+$STD apt-get -y autoclean
+msg_ok "Cleaned up"
+
+echo ""
+msg_ok "Frigate installation complete"
+if $INSTALL_OPENVINO; then
+  msg_ok "Detector: OpenVino (Intel hardware acceleration)"
+else
+  msg_ok "Detector: CPU/TFLite with ${DETECT_THREADS} threads"
+  msg_info "Note: Edit /opt/frigate/config/config.yml to tune num_threads"
+fi
+msg_info "Add your cameras to: /opt/frigate/config/config.yml"
+msg_info "Web UI available at: http://$(hostname -I | awk '{print $1}'):5000"
