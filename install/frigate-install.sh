@@ -12,6 +12,11 @@ setting_up_container
 network_check
 update_os
 
+# Disable IPv6 to prevent connection failures on hosts without IPv6 routing
+echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
+echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
+sysctl -p -q
+
 # Read OpenVino choice written by ct/frigate.sh launcher.
 # Falls back to auto-detection from /proc/cpuinfo if not set.
 if [ -f /tmp/frigate.conf ]; then
